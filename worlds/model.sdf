@@ -1,0 +1,314 @@
+<?xml version="1.0"?>
+<!--
+  DP7 Custom sjtu_drone — Autonomous Navigator for GPS-Denied Environments
+  =========================================================================
+  Equipped with:
+    • Stereo camera pair  (left + right, 752×480, 60Hz, 0.12m baseline)
+    • High-rate IMU       (200Hz, Gazebo gaussian noise)
+    • Ground truth plugin (libgazebo_ros_p3d for evaluation)
+    • Odometry plugin     (wheel-equivalent for cmd_vel interface)
+
+  Sensor frame convention:
+    base_link  : x-forward, y-left, z-up  (ROS/ENU body frame)
+    camera_opt : z-forward, x-right, y-down (optical frame — VINS convention)
+
+  Extrinsics (verified values for this SDF layout):
+    T_left_cam_to_imu:   R=[[0,-1,0],[0,0,-1],[1,0,0]]  t=[0.1, 0.06, 0.0]
+    T_right_cam_to_imu:  R=[[0,-1,0],[0,0,-1],[1,0,0]]  t=[0.1,-0.06, 0.0]
+    Stereo baseline: 0.12m  (right is -y relative to left)
+-->
+<sdf version="1.6">
+  <model name="sjtu_drone">
+
+    <!-- ═══════════════════════════════════════════
+         BODY / BASE LINK
+    ═══════════════════════════════════════════ -->
+    <link name="base_link">
+      <pose>0 0 0 0 0 0</pose>
+
+      <inertial>
+        <mass>1.477</mass>
+        <inertia>
+          <ixx>0.01152</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.01152</iyy>
+          <iyz>0</iyz>
+          <izz>0.0218</izz>
+        </inertia>
+      </inertial>
+
+      <!-- Body collision (simplified box for compute efficiency) -->
+      <collision name="body_collision">
+        <pose>0 0 0.02 0 0 0</pose>
+        <geometry>
+          <box><size>0.47 0.47 0.11</size></box>
+        </geometry>
+      </collision>
+
+      <!-- Visual mesh -->
+      <visual name="body_visual">
+        <pose>0 0 0 0 0 0</pose>
+        <geometry>
+          <box><size>0.47 0.47 0.11</size></box>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.8 1</ambient>
+          <diffuse>0.2 0.2 0.8 1</diffuse>
+        </material>
+      </visual>
+
+      <!-- Rotor visuals (decorative — physics handled by plugin) -->
+      <visual name="rotor_fl">
+        <pose>0.18 0.18 0.06 0 0 0</pose>
+        <geometry><cylinder><radius>0.12</radius><length>0.01</length></cylinder></geometry>
+        <material><ambient>0.1 0.1 0.1 0.8</ambient></material>
+      </visual>
+      <visual name="rotor_fr">
+        <pose>0.18 -0.18 0.06 0 0 0</pose>
+        <geometry><cylinder><radius>0.12</radius><length>0.01</length></cylinder></geometry>
+        <material><ambient>0.1 0.1 0.1 0.8</ambient></material>
+      </visual>
+      <visual name="rotor_rl">
+        <pose>-0.18 0.18 0.06 0 0 0</pose>
+        <geometry><cylinder><radius>0.12</radius><length>0.01</length></cylinder></geometry>
+        <material><ambient>0.1 0.1 0.1 0.8</ambient></material>
+      </visual>
+      <visual name="rotor_rr">
+        <pose>-0.18 -0.18 0.06 0 0 0</pose>
+        <geometry><cylinder><radius>0.12</radius><length>0.01</length></cylinder></geometry>
+        <material><ambient>0.1 0.1 0.1 0.8</ambient></material>
+      </visual>
+
+      <!-- ═══════════════════════════
+           LEFT CAMERA SENSOR
+      ═══════════════════════════ -->
+      <sensor name="left_camera" type="camera">
+        <!--
+          Pose relative to base_link:
+            x=0.10 (10cm forward)
+            y=+0.06 (6cm left — half of 0.12m baseline)
+            z=0.00
+          Roll=π/2, Pitch=0, Yaw=-π/2  ← rotates camera to optical convention
+          (z-forward, x-right, y-down)
+        -->
+        <pose>0.10 0.06 0.00 -1.5708 0 -1.5708</pose>
+        <always_on>1</always_on>
+        <update_rate>60</update_rate>
+        <visualize>false</visualize>
+
+        <camera name="left_camera">
+          <horizontal_fov>1.3962634</horizontal_fov>  <!-- 80° FOV -->
+          <image>
+            <width>752</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.05</near>
+            <far>50.0</far>
+          </clip>
+          <!-- Perfect pinhole — no distortion for simulator -->
+          <distortion>
+            <k1>0.0</k1>
+            <k2>0.0</k2>
+            <k3>0.0</k3>
+            <p1>0.0</p1>
+            <p2>0.0</p2>
+            <center>0.5 0.5</center>
+          </distortion>
+          <lens>
+            <type>stereographic</type>
+            <scale_to_hfov>true</scale_to_hfov>
+          </lens>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.005</stddev>
+          </noise>
+        </camera>
+
+        <plugin name="left_camera_plugin"
+                filename="libgazebo_ros_camera.so">
+          <ros>
+            <namespace>/simple_drone</namespace>
+            <remapping>image_raw:=left_camera/image_raw</remapping>
+            <remapping>camera_info:=left_camera/camera_info</remapping>
+          </ros>
+          <camera_name>left_camera</camera_name>
+          <frame_name>left_camera_optical_frame</frame_name>
+          <hack_baseline>0.0</hack_baseline>
+        </plugin>
+      </sensor>
+
+      <!-- ═══════════════════════════
+           RIGHT CAMERA SENSOR
+      ═══════════════════════════ -->
+      <sensor name="right_camera" type="camera">
+        <!--
+          Same as left but y=-0.06 (right side of baseline)
+        -->
+        <pose>0.10 -0.06 0.00 -1.5708 0 -1.5708</pose>
+        <always_on>1</always_on>
+        <update_rate>60</update_rate>
+        <visualize>false</visualize>
+
+        <camera name="right_camera">
+          <horizontal_fov>1.3962634</horizontal_fov>
+          <image>
+            <width>752</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.05</near>
+            <far>50.0</far>
+          </clip>
+          <distortion>
+            <k1>0.0</k1><k2>0.0</k2><k3>0.0</k3>
+            <p1>0.0</p1><p2>0.0</p2>
+            <center>0.5 0.5</center>
+          </distortion>
+          <lens>
+            <type>stereographic</type>
+            <scale_to_hfov>true</scale_to_hfov>
+          </lens>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.005</stddev>
+          </noise>
+        </camera>
+
+        <plugin name="right_camera_plugin"
+                filename="libgazebo_ros_camera.so">
+          <ros>
+            <namespace>/simple_drone</namespace>
+            <remapping>image_raw:=right_camera/image_raw</remapping>
+            <remapping>camera_info:=right_camera/camera_info</remapping>
+          </ros>
+          <camera_name>right_camera</camera_name>
+          <frame_name>right_camera_optical_frame</frame_name>
+          <hack_baseline>0.0</hack_baseline>
+        </plugin>
+      </sensor>
+
+      <!-- ═══════════════════════════
+           IMU SENSOR (200 Hz)
+      ═══════════════════════════ -->
+      <sensor name="imu_sensor" type="imu">
+        <!-- IMU at body origin (base_link centre) -->
+        <pose>0 0 0 0 0 0</pose>
+        <always_on>true</always_on>
+        <update_rate>200</update_rate>
+        <visualize>false</visualize>
+
+        <imu>
+          <angular_velocity>
+            <x>
+              <noise type="gaussian">
+                <mean>0.0</mean>
+                <stddev>0.005</stddev>   <!-- gyro noise density -->
+                <bias_mean>0.0</bias_mean>
+                <bias_stddev>0.00001</bias_stddev>
+              </noise>
+            </x>
+            <y>
+              <noise type="gaussian">
+                <mean>0.0</mean>
+                <stddev>0.005</stddev>
+                <bias_mean>0.0</bias_mean>
+                <bias_stddev>0.00001</bias_stddev>
+              </noise>
+            </y>
+            <z>
+              <noise type="gaussian">
+                <mean>0.0</mean>
+                <stddev>0.005</stddev>
+                <bias_mean>0.0</bias_mean>
+                <bias_stddev>0.00001</bias_stddev>
+              </noise>
+            </z>
+          </angular_velocity>
+
+          <linear_acceleration>
+            <x>
+              <noise type="gaussian">
+                <mean>0.0</mean>
+                <stddev>0.01</stddev>   <!-- accel noise density -->
+                <bias_mean>0.0</bias_mean>
+                <bias_stddev>0.0001</bias_stddev>
+              </noise>
+            </x>
+            <y>
+              <noise type="gaussian">
+                <mean>0.0</mean>
+                <stddev>0.01</stddev>
+                <bias_mean>0.0</bias_mean>
+                <bias_stddev>0.0001</bias_stddev>
+              </noise>
+            </y>
+            <z>
+              <noise type="gaussian">
+                <mean>0.0</mean>
+                <stddev>0.01</stddev>
+                <bias_mean>0.0</bias_mean>
+                <bias_stddev>0.0001</bias_stddev>
+              </noise>
+            </z>
+          </linear_acceleration>
+        </imu>
+
+        <plugin name="imu_plugin" filename="libgazebo_ros_imu_sensor.so">
+          <ros>
+            <namespace>/simple_drone</namespace>
+            <remapping>~/out:=imu/out</remapping>
+          </ros>
+          <initial_orientation_as_reference>false</initial_orientation_as_reference>
+        </plugin>
+      </sensor>
+
+      <!-- ═══════════════════════════
+           GROUND TRUTH PLUGIN
+           (for trajectory evaluation)
+      ═══════════════════════════ -->
+      <plugin name="ground_truth_plugin" filename="libgazebo_ros_p3d.so">
+        <ros>
+          <namespace>/simple_drone</namespace>
+          <remapping>odom:=ground_truth/odom</remapping>
+        </ros>
+        <frame_name>world</frame_name>
+        <body_name>base_link</body_name>
+        <xyz_offset>0 0 0</xyz_offset>
+        <rpy_offset>0 0 0</rpy_offset>
+        <gaussian_noise>0.0</gaussian_noise>  <!-- perfect GT, no noise -->
+        <update_rate>100</update_rate>
+      </plugin>
+
+      <!-- ═══════════════════════════
+           SIMPLE DRONE FLIGHT PLUGIN
+           (cmd_vel → thrust/attitude)
+      ═══════════════════════════ -->
+      <plugin name="simple_drone_plugin" filename="libgazebo_ros_planar_move.so">
+        <ros>
+          <namespace>/simple_drone</namespace>
+        </ros>
+        <publish_odom>true</publish_odom>
+        <publish_odom_tf>true</publish_odom_tf>
+        <odometry_frame>odom</odometry_frame>
+        <robot_base_frame>base_link</robot_base_frame>
+      </plugin>
+
+    </link>
+
+    <!-- ═══════════════════════════════════════════
+         STATIC TF: base_link → camera optical frames
+         These must match the sensor <pose> values above
+    ═══════════════════════════════════════════ -->
+
+    <!-- Left camera body → optical frame transform
+         The camera pose in SDF: (0.10, 0.06, 0, -π/2, 0, -π/2)
+         In ROS TF this becomes the static transform published below -->
+
+  </model>
+</sdf>

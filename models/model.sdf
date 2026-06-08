@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="sjtu_drone">
+    <link name="base_link">
+      <pose>0 0 0 0 0 0</pose>
+      <gravity>false</gravity>
+      <inertial>
+        <mass>1.477</mass>
+        <inertia><ixx>0.01152</ixx><iyy>0.01152</iyy><izz>0.0218</izz></inertia>
+      </inertial>
+      <collision name="body_col"><geometry><box><size>0.47 0.47 0.11</size></box></geometry></collision>
+      <visual name="body_vis"><geometry><box><size>0.47 0.47 0.11</size></box></geometry><material><ambient>0.1 0.3 0.8 1</ambient></material></visual>
+
+      <sensor name="left_camera" type="camera">
+        <pose>0.25 0.06 0.00 0 0 0</pose>
+        <always_on>true</always_on><update_rate>30</update_rate><visualize>false</visualize>
+        <camera name="left_camera">
+          <horizontal_fov>1.3962634</horizontal_fov>
+          <image><width>752</width><height>480</height><format>R8G8B8</format></image>
+          <clip><near>0.05</near><far>50.0</far></clip>
+        </camera>
+        <plugin name="left_camera_plugin" filename="libgazebo_ros_camera.so">
+          <ros><namespace>/simple_drone</namespace><remapping>image_raw:=left_camera/image_raw</remapping><remapping>camera_info:=left_camera/camera_info</remapping></ros>
+          <camera_name>left_camera</camera_name>
+          <frame_name>left_camera_link</frame_name>
+        </plugin>
+      </sensor>
+
+      <sensor name="right_camera" type="camera">
+        <pose>0.25 -0.06 0.00 0 0 0</pose>
+        <always_on>true</always_on><update_rate>30</update_rate><visualize>false</visualize>
+        <camera name="right_camera">
+          <horizontal_fov>1.3962634</horizontal_fov>
+          <image><width>752</width><height>480</height><format>R8G8B8</format></image>
+          <clip><near>0.05</near><far>50.0</far></clip>
+        </camera>
+        <plugin name="right_camera_plugin" filename="libgazebo_ros_camera.so">
+          <ros><namespace>/simple_drone</namespace><remapping>image_raw:=right_camera/image_raw</remapping><remapping>camera_info:=right_camera/camera_info</remapping></ros>
+          <camera_name>right_camera</camera_name>
+          <frame_name>right_camera_link</frame_name>
+        </plugin>
+      </sensor>
+
+      <sensor name="imu_sensor" type="imu">
+        <pose>0 0 0 0 0 0</pose>
+        <always_on>true</always_on><update_rate>200</update_rate>
+        <plugin name="imu_plugin" filename="libgazebo_ros_imu_sensor.so">
+          <ros><namespace>/simple_drone</namespace><remapping>~/out:=imu/out</remapping></ros>
+          <initial_orientation_as_reference>false</initial_orientation_as_reference>
+        </plugin>
+      </sensor>
+    </link>
+
+    <plugin name="planar_move" filename="libgazebo_ros_planar_move.so">
+      <ros><namespace>/simple_drone</namespace><remapping>cmd_vel:=cmd_vel</remapping><remapping>odom:=odom</remapping></ros>
+      <update_rate>50</update_rate><publish_odom>true</publish_odom><publish_odom_tf>false</publish_odom_tf>
+      <odometry_frame>odom</odometry_frame><robot_base_frame>base_link</robot_base_frame>
+    </plugin>
+  </model>
+</sdf>

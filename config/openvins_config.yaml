@@ -1,0 +1,124 @@
+# ============================================================
+#  OpenVINS / MSCKF Configuration — DP7 Autonomous Navigator
+#  Target: Gazebo Harmonic simulated drone, ROS 2 Humble
+#  Hardware: Student laptop (limited CPU/RAM)
+#  Tuned for: Tunnel VIO with stereo camera + 6-axis IMU
+# ============================================================
+
+# ── Gravity ─────────────────────────────────────────────────
+g_norm: 9.81
+
+# ── IMU noise parameters ─────────────────────────────────────
+# Gazebo uses ideal IMU by default — these are intentionally
+# generous to avoid false initialization failures on sim.
+# If using a real-world sensor, tighten these values.
+accelerometer_noise_density: 0.01      # [m/s^2/sqrt(Hz)]
+gyroscope_noise_density:     0.005     # [rad/s/sqrt(Hz)]
+accelerometer_random_walk:   0.0002    # [m/s^3/sqrt(Hz)]
+gyroscope_random_walk:       0.00002   # [rad/s^2/sqrt(Hz)]
+
+# ── Camera intrinsics (pinhole, zero distortion) ─────────────
+# Match your Gazebo SDF <horizontal_fov>, <width>, <height>
+# For 90-deg FOV, 752×480:  fx = fy = (752/2) / tan(pi/4) = 376
+fx: 376.0
+fy: 376.0
+cx: 376.0   # width  / 2
+cy: 240.0   # height / 2
+
+# Distortion coefficients — zero for ideal Gazebo pinhole
+k1: 0.0
+k2: 0.0
+p1: 0.0
+p2: 0.0
+
+# Camera image size
+image_width:  752
+image_height: 480
+
+# ── Camera extrinsics ────────────────────────────────────────
+# T_cam0_imu: rigid transform FROM IMU frame TO left-camera frame
+# Convention: X-forward, Y-left, Z-up (ROS REP-103)
+# For a front-facing stereo camera on a drone body:
+#   Camera optical Z = drone X-forward
+#   Camera optical X = drone -Y
+#   Camera optical Y = drone -Z
+#
+# Adjust the translation [tx, ty, tz] to match your SDF
+# extrinsic placement (camera position relative to IMU in metres).
+T_cam0_imu:
+  - [ 0, -1,  0,  0.05]   # row 0: camera X = -body Y
+  - [ 0,  0, -1,  0.00]   # row 1: camera Y = -body Z
+  - [ 1,  0,  0,  0.00]   # row 2: camera Z =  body X (forward)
+  - [ 0,  0,  0,  1.00]   # homogeneous
+
+# T_cam1_imu: right camera (stereo baseline = 0.12 m along camera X)
+T_cam1_imu:
+  - [ 0, -1,  0,  0.05]
+  - [ 0,  0, -1, -0.12]   # 12 cm baseline offset in camera-Y (body -Z)
+  - [ 1,  0,  0,  0.00]
+  - [ 0,  0,  0,  1.00]
+
+# Stereo baseline (metres) — must match Gazebo camera <pose> separation
+stereo_baseline: 0.12
+
+# ── MSCKF feature tracker parameters ─────────────────────────
+# Tuned for laptop CPU budget (~2 cores available for VIO)
+max_features_per_frame: 120   # keep low for CPU budget
+min_feature_distance:    15   # pixels — avoid feature crowding
+pyramid_levels:           3   # LK-optical-flow pyramid depth
+lk_win_size:             21   # Lucas-Kanade window
+
+# ── EKF initial covariance ────────────────────────────────────
+init_cov_position:    0.001   # [m^2]    — tight on position
+init_cov_velocity:    0.01    # [m/s]^2
+init_cov_orientation: 0.001   # [rad]^2
+init_cov_bias_acc:    0.0001  # [m/s^2]^2
+init_cov_bias_gyr:    0.00001 # [rad/s]^2
+
+# ── Initialization ────────────────────────────────────────────
+# Number of IMU samples required to align gravity before VIO starts.
+# Higher = more stable but slower startup.  20 = ~0.1 s at 200 Hz.
+init_imu_frames_needed: 30
+# Static acceleration norm tolerance (m/s^2).
+# Drone must be within this of 9.81 to confirm static init.
+init_static_threshold: 1.2
+
+# ── Tunnel environment geometry ───────────────────────────────
+tunnel_width:  4.0    # metres — used by tunnel_constraint_node
+tunnel_height: 3.0
+cruise_height: 1.5
+
+# ── Feature descriptor ────────────────────────────────────────
+# (used by RatSLAM visual template manager)
+ratslam_descriptor_size:    64
+ratslam_match_threshold:    0.88
+ratslam_min_template_spacing_m: 0.5
+
+# ── Fourier VIO enhancement ───────────────────────────────────
+fourier_flow_grid:      16     # dense flow grid resolution
+fourier_reject_fraction: 0.15  # fraction of spectrum to suppress
+velocity_lp_cutoff_hz:   5.0   # velocity smoother cutoff
+imu_vibration_update_interval_s: 5.0
+
+# ── Autopilot PID gains ───────────────────────────────────────
+autopilot_kp: 0.5   1.2
+autopilot_ki: 0.01   0.05
+autopilot_kd: 0.1   0.3
+autopilot_max_speed: 1.0   # m/s — conservative for tunnel
+tunnel_length:  50.0
+
+# ── Adaptive Covariance Scaling (ACS) — Innovation Layer ──────
+# ACS monitors the EKF innovation norm and dynamically scales
+# process noise when the innovation exceeds a threshold.
+# This prevents filter divergence during fast manoeuvres without
+# requiring manual re-tuning of Q/R matrices.
+acs_enable:              true
+acs_innovation_threshold: 0.15   # normalised innovation threshold
+acs_scale_factor_max:     8.0    # max process-noise inflation
+acs_decay_rate:           0.95   # per-step decay back to nominal
+
+# ── Topic remapping (override per-machine if needed) ──────────
+imu_topic:   /simple_drone/imu/out
+cam0_topic:  /simple_drone/left_camera/image_raw
+cam1_topic:  /simple_drone/right_camera/image_raw
+odom_gt_topic: /simple_drone/odom

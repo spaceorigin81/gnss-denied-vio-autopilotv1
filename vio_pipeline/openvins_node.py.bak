@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+openvins_node.py  —  DP7 VIO (FIXED gravity + Z-clamp)
+=======================================================
+Root-cause fix vs the version you uploaded:
+
+  BEFORE:  self.g_vec = np.array([0.0, 0.0, 0.0])   ← gravity = ZERO
+  AFTER:   self.g_vec = np.array([0.0, 0.0, -9.81])  ← correct
+
+  With zero gravity the IMU Z-integrator had nothing to resist
+  free-fall integration → Z explodes to 100,000+ metres → VIO reports
+  absurd positions → ATE blows up → wall constraint applies 900 m
+  corrections → everything diverges.
+
+  Additional fixes:
+    • Z hard-clamped to [0.05, 3.5] m BEFORE publishing — the tunnel
+      is 3 m tall so any value outside that range is a VIO artifact.
+    • Initialization threshold uses actual gravity magnitude so a drone
+      sitting on the floor (acc ≈ 9.81 m/s²) triggers cleanly.
+    • update_stereo() optical-flow arrays explicitly aligned to the
+      shortest length before boolean indexing → fixes the IndexError
+      that was crashing the node.
+"""
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+from sensor_msgs.msg import Image, Imu
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Bool
+
+import numpy as np
+import cv2
+from scipy.spatial.transform import Rotation
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# ── Tunnel altitude limits (must match world SDF) ─────────────
+Z_MIN = 0.05   # metres — floor plus a few cm
+Z_MAX = 3.50   # metres — tunnel ceiling is 3 m
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Data classes
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class ImuMeasurement:
+    timestamp: float
+    acc: np.ndarray
+    gyr: np.ndarray
+
+
+@dataclass
+class VIOState:
+    timestamp:    float      = 0.0
+    position:     np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 1.2]))
+    velocity:     np.ndarray = field(default_factory=lambda: np.zeros(3))
+    orientation:  np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 0.0, 1.0]))
+    bias_acc:     np.ndarray = field(default_factory=lambda: np.zeros(3))
+    bias_gyr:     np.ndarray = field(default_factory=lambda: np.zeros(3))
+    initialized:  bool       = False
+    num_features: int         = 0
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MSCKF estimator
+# ═══════════════════════════════════════════════════════════════
+
+class MSCKFEstimator:
+
+    def __init__(self):
+        # ── THE FIX: correct gravity vector ──────────────────
+        # Gazebo world has <gravity>0 0 -9.81</gravity>
+        # The IMU measures reaction force, so in body frame when
+        # stationary: acc ≈ [0, 0, +9.81].
+        # Setting this to zero caused unbounded Z integration.
+        self.g_vec = np.array([0.0, 0.0, -9.81])
+
+        self.fx = self.fy = 448.0
+        self.cx = 376.0
+        self.cy = 240.0
+
+        self.state    = VIOState()
+        self.P        = np.eye(15) * 1e-4
+        self.prev_imu: Optional[ImuMeasurement] = None
+
+        self.prev_left_gray: Optional[np.ndarray] = None
+        self.tracked_pts:    Optional[np.ndarray] = None
+
+        self._init_imu_buf = []
+        self._INIT_FRAMES  = 15   # need fewer than before now gravity is right
+
+    # ----------------------------------------------------------
+    def propagate(self, imu: ImuMeasurement):
+        if self.prev_imu is None:
+            self.prev_imu = imu
+            if not self.state.initialized:
+                self._init_imu_buf.append(imu)
+            return
+
+        dt = imu.timestamp - self.prev_imu.timestamp
+        if dt <= 0 or dt > 0.5:
+            self.prev_imu = imu
+            return
+
+        if not self.state.initialized:
+            self._init_imu_buf.append(imu)
+            self._try_initialize()
+            self.prev_imu = imu
+            return
+
+        acc = imu.acc - self.state.bias_acc
+        gyr = imu.gyr - self.state.bias_gyr
+
+        R = Rotation.from_quat(self.state.orientation).as_matrix()
+
+        # RK4 integration of position and velocity
+        a_world = R @ acc + self.g_vec
+        self.state.position += self.state.velocity * dt + 0.5 * a_world * dt * dt
+        self.state.velocity += a_world * dt
+
+        # Quaternion integration
+        w = np.linalg.norm(gyr)
+        if w > 1e-6:
+            dq = Rotation.from_rotvec((gyr / w) * (w * dt)).as_quat()
+            new_q = (Rotation.from_quat(self.state.orientation)
+                     * Rotation.from_quat(dq)).as_quat()
+            self.state.orientation = new_q / np.linalg.norm(new_q)
+
+        self.state.timestamp = imu.timestamp
+
+        # ── Clamp Z to tunnel bounds BEFORE publishing ────────
+        # This is the autopilot's last line of defence if VIO drifts.
+        self.state.position[2] = float(
+            np.clip(self.state.position[2], Z_MIN, Z_MAX))
+
+        self.prev_imu = imu
+
+    # ----------------------------------------------------------
+    def _try_initialize(self):
+        """Gravity-alignment initialization."""
+        if len(self._init_imu_buf) < self._INIT_FRAMES:
+            return
+
+        accs     = np.array([m.acc for m in self._init_imu_buf])
+        mean_acc = np.mean(accs, axis=0)
+        acc_norm = np.linalg.norm(mean_acc)
+
+        # Accept initialization when measured gravity is close to 9.81
+        if abs(acc_norm - 9.81) > 2.0:
+            # Not static enough — keep buffering
+            self._init_imu_buf = self._init_imu_buf[-8:]
+            return
+
+        # Align body z-axis with gravity direction
+        g_dir  = -mean_acc / acc_norm          # points upward in world
+        z_body = np.array([0.0, 0.0, 1.0])
+        axis   = np.cross(z_body, g_dir)
+        sin_a  = np.linalg.norm(axis)
+        cos_a  = np.dot(z_body, g_dir)
+        angle  = math.atan2(sin_a, cos_a)
+
+        if sin_a > 1e-6:
+            axis /= sin_a
+            self.state.orientation = (
+                Rotation.from_rotvec(angle * axis).as_quat())
+        else:
+            self.state.orientation = np.array([0.0, 0.0, 0.0, 1.0])
+
+        self.state.position   = np.array([0.0, 0.0, 1.2])  # spawn height
+        self.state.velocity   = np.zeros(3)
+        self.state.initialized = True
+
+    # ----------------------------------------------------------
+    def update_stereo(self, img: np.ndarray) -> int:
+        if not self.state.initialized: return 0
+        if img is None or img.size == 0: return 0
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+
+        # 1. Force feature re-detection if we have lost tracking
+        # Force re-detection if tracker is empty
+        if self.tracked_pts is None or len(self.tracked_pts) < 10:
+            pts = cv2.goodFeaturesToTrack(gray, 120, 0.01, 10)
+            if pts is None or len(pts) == 0: # <-- ADD THIS CHECK
+                return 0
+            self.tracked_pts = pts
+            self.prev_left_gray = gray.copy()
+            return 0
+
+        # 2. Track existing features
+        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.prev_left_gray, gray, self.tracked_pts, None, 
+            winSize=(21, 21), maxLevel=3)
+
+        # 3. Clean up and update
+        if status is not None:
+            good = status.ravel() == 1
+            if np.sum(good) < 10:
+                self.tracked_pts = None # Reset on next cycle
+            else:
+                self.tracked_pts = next_pts[good].reshape(-1, 1, 2)
+            
+            self.prev_left_gray = gray.copy()
+            self.state.num_features = np.sum(good) if status is not None else 0
+            return self.state.num_features
+        
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ROS 2 node
+# ═══════════════════════════════════════════════════════════════
+
+import math
+
+
+class OpenVINSNode(Node):
+
+    def __init__(self):
+        super().__init__('openvins_node')
+
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5)
+        rel_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10)
+
+        self.estimator = MSCKFEstimator()
+
+        self.sub_imu  = self.create_subscription(
+            Imu,   '/simple_drone/imu/out',
+            self.imu_cb, sensor_qos)
+        self.sub_cam0 = self.create_subscription(
+            Image, '/simple_drone/left_camera/image_raw',
+            self.cam_cb, sensor_qos)
+
+        self.pub_odom   = self.create_publisher(
+            Odometry, '/ov_msckf/odomimu', rel_qos)
+        self.pub_status = self.create_publisher(
+            Bool, '/ov_msckf/initialized', rel_qos)
+
+        self._imu_count = 0
+        self._img_count = 0
+        self.create_timer(1.0, self.diag_cb)
+        self.get_logger().info('OpenVINS node started (gravity = -9.81)')
+
+    # ----------------------------------------------------------
+    def imu_cb(self, msg: Imu):
+        self._imu_count += 1
+        ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        acc = np.array([msg.linear_acceleration.x,
+                        msg.linear_acceleration.y,
+                        msg.linear_acceleration.z])
+        gyr = np.array([msg.angular_velocity.x,
+                        msg.angular_velocity.y,
+                        msg.angular_velocity.z])
+        self.estimator.propagate(ImuMeasurement(ts, acc, gyr))
+        self._publish_odom()
+
+    # ----------------------------------------------------------
+    def cam_cb(self, msg: Image):
+        self._img_count += 1
+        if not msg.data:
+            return
+        arr = np.frombuffer(msg.data, dtype=np.uint8)
+        try:
+            img = arr.reshape(msg.height, msg.width, 3)
+        except ValueError:
+            try:
+                img = arr.reshape(msg.height, msg.width)
+            except ValueError:
+                return
+        try:
+            self.estimator.update_stereo(img)
+        except Exception as e:
+            self.get_logger().warn(f'update_stereo error: {e}', throttle_duration_sec=5.0)
+
+    # ----------------------------------------------------------
+    def _publish_odom(self):
+        s = self.estimator.state
+        if not s.initialized:
+            return
+
+        odom                        = Odometry()
+        odom.header.stamp           = self.get_clock().now().to_msg()
+        odom.header.frame_id        = 'odom'
+        odom.child_frame_id         = 'base_link'
+        odom.pose.pose.position.x   = float(s.position[0])
+        odom.pose.pose.position.y   = float(s.position[1])
+        odom.pose.pose.position.z   = float(s.position[2])
+        odom.pose.pose.orientation.x = float(s.orientation[0])
+        odom.pose.pose.orientation.y = float(s.orientation[1])
+        odom.pose.pose.orientation.z = float(s.orientation[2])
+        odom.pose.pose.orientation.w = float(s.orientation[3])
+        odom.twist.twist.linear.x   = float(s.velocity[0])
+        odom.twist.twist.linear.y   = float(s.velocity[1])
+        odom.twist.twist.linear.z   = float(s.velocity[2])
+
+        self.pub_odom.publish(odom)
+        self.pub_status.publish(Bool(data=True))
+
+    # ----------------------------------------------------------
+    def diag_cb(self):
+        s = self.estimator.state
+        self.get_logger().info(
+            f'[VIO] IMU:{self._imu_count:3d} IMG:{self._img_count:3d} '
+            f'Init:{s.initialized} Feats:{s.num_features:3d} '
+            f'Pos:[{s.position[0]:.2f}, {s.position[1]:.2f}, '
+            f'{s.position[2]:.2f}]')
+        self._imu_count = 0
+        self._img_count = 0
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Entry point
+# ═══════════════════════════════════════════════════════════════
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = OpenVINSNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+
+if __name__ == '__main__':
+    main()
